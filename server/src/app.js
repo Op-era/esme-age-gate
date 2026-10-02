@@ -22,6 +22,8 @@ function createApp(opts = {}) {
     minSolveMs: opts.minSolveMs ?? 1500,
     minMoves: opts.minMoves ?? 4,
     rateLimit: opts.rateLimit ?? { windowMs: 60 * 1000, challenge: 20, verify: 20, gate: 40 },
+    maxFails: opts.maxFails ?? 3,
+    lockoutMs: opts.lockoutMs ?? 5 * 60 * 1000,
     maxPending: opts.maxPending ?? 3000,
     trustFlyHeader: opts.trustFlyHeader ?? !!process.env.FLY_APP_NAME,
   };
@@ -32,12 +34,14 @@ function createApp(opts = {}) {
   /** @type {Map<string, {offset:number, answer:number, issuedAt:number, expiresAt:number, ip:string}>} */
   const challenges = new Map();
   const hits = new Map(); // `${bucket}:${ip}` -> number[]
+  const fails = new Map(); // ip -> { count, lockedUntil }
 
   const app = express();
   app.disable('x-powered-by');
   app.set('trust proxy', 1);
   app.locals.challenges = challenges; // exposed for tests only
   app.locals.cfg = cfg;
+  app.locals.fails = fails; // exposed for tests only
 
   const clientIp = (req) => (cfg.trustFlyHeader && req.headers['fly-client-ip']) || req.ip || 'unknown';
 
@@ -72,6 +76,36 @@ function createApp(opts = {}) {
     next();
   };
 
+  // --- failed-attempt lockout: N consecutive failed answers from one IP -> blocked for lockoutMs ---
+  const retryAfterSec = (rec) => Math.max(1, Math.ceil((rec.lockedUntil - Date.now()) / 1000));
+  const lockCheck = (req, res, next) => {
+    const rec = fails.get(clientIp(req));
+    if (rec && rec.lockedUntil > Date.now()) {
+      const ra = retryAfterSec(rec);
+      res.setHeader('Retry-After', ra);
+      return res.status(429).json({ ok: false, error: 'locked', retryAfterSec: ra });
+    }
+    next();
+  };
+  // returns the lockout response body if this failure triggered a lock, else null
+  const registerFail = (ip) => {
+    const now = Date.now();
+    let rec = fails.get(ip);
+    if (!rec || (rec.lockedUntil && rec.lockedUntil <= now)) rec = { count: 0, lockedUntil: 0 };
+    rec.count += 1;
+    if (rec.count >= cfg.maxFails) rec.lockedUntil = now + cfg.lockoutMs;
+    fails.set(ip, rec);
+    return rec.lockedUntil > now ? { ok: false, error: 'locked', retryAfterSec: retryAfterSec(rec) } : null;
+  };
+  const failResponse = (req, res, error) => {
+    const locked = registerFail(clientIp(req));
+    if (locked) {
+      res.setHeader('Retry-After', locked.retryAfterSec);
+      return res.status(429).json(locked);
+    }
+    return res.status(error === 'wrong_angle' ? 200 : 400).json({ ok: false, error });
+  };
+
   const sign = (payload) => {
     const body = b64u(JSON.stringify(payload));
     const mac = crypto.createHmac('sha256', cfg.secret).update(body).digest();
@@ -95,6 +129,7 @@ function createApp(opts = {}) {
   const sweep = () => {
     const now = Date.now();
     for (const [id, c] of challenges) if (c.expiresAt < now) challenges.delete(id);
+    for (const [ip, rec] of fails) if (rec.lockedUntil && rec.lockedUntil <= now) fails.delete(ip);
     for (const [k, arr] of hits) {
       const f = arr.filter((t) => now - t < cfg.rateLimit.windowMs);
       if (f.length) hits.set(k, f); else hits.delete(k);
@@ -107,7 +142,7 @@ function createApp(opts = {}) {
   app.get('/healthz', (_req, res) => res.json({ ok: true }));
 
   // --- GET /challenge ---
-  app.get('/challenge', limit('challenge'), async (req, res) => {
+  app.get('/challenge', lockCheck, limit('challenge'), async (req, res) => {
     sweep();
     if (challenges.size >= cfg.maxPending) return res.status(503).json({ error: 'busy' });
     try {
@@ -133,7 +168,7 @@ function createApp(opts = {}) {
   });
 
   // --- POST /verify ---
-  app.post('/verify', limit('verify'), (req, res) => {
+  app.post('/verify', lockCheck, limit('verify'), (req, res) => {
     const { id, angle, moves } = req.body || {};
     if (typeof id !== 'string' || id.length > 64 || typeof angle !== 'number' || !Number.isFinite(angle)) {
       return res.status(400).json({ error: 'bad_request' });
@@ -145,20 +180,21 @@ function createApp(opts = {}) {
     if (now > c.expiresAt) return res.status(400).json({ ok: false, error: 'expired' });
 
     // behaviour checks
-    if (now - c.issuedAt < cfg.minSolveMs) return res.status(400).json({ ok: false, error: 'too_fast' });
+    if (now - c.issuedAt < cfg.minSolveMs) return failResponse(req, res, 'too_fast');
     if (!Array.isArray(moves) || moves.length < cfg.minMoves || moves.length > 2000) {
-      return res.status(400).json({ ok: false, error: 'no_interaction' });
+      return failResponse(req, res, 'no_interaction');
     }
     let prevT = -1; const distinct = new Set(); let valid = true;
     for (const m of moves) {
       if (!Array.isArray(m) || m.length !== 2 || !Number.isFinite(m[0]) || !Number.isFinite(m[1]) || m[0] < prevT) { valid = false; break; }
       prevT = m[0]; distinct.add(Math.round(m[1]));
     }
-    if (!valid || distinct.size < cfg.minMoves) return res.status(400).json({ ok: false, error: 'no_interaction' });
-    if (angDiff(moves[moves.length - 1][1], angle) > 1) return res.status(400).json({ ok: false, error: 'inconsistent' });
+    if (!valid || distinct.size < cfg.minMoves) return failResponse(req, res, 'no_interaction');
+    if (angDiff(moves[moves.length - 1][1], angle) > 1) return failResponse(req, res, 'inconsistent');
 
-    if (angDiff(angle, c.answer) > cfg.toleranceDeg) return res.status(200).json({ ok: false, error: 'wrong_angle' });
+    if (angDiff(angle, c.answer) > cfg.toleranceDeg) return failResponse(req, res, 'wrong_angle');
 
+    fails.delete(clientIp(req)); // success resets the consecutive-fail counter
     const token = sign({ v: 1, jti: crypto.randomBytes(8).toString('hex'), iat: now, exp: now + cfg.tokenTtlMs });
     res.json({ ok: true, token, expiresInMs: cfg.tokenTtlMs });
   });

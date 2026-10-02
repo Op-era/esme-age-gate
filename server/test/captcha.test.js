@@ -110,3 +110,66 @@ test('expired/forged tokens rejected', async () => {
   assert.strictEqual((await fetch(`${base}/gate`, { headers: { authorization: `Bearer ${forged}` } })).status, 401);
   close();
 });
+
+// ---- lockout ----
+async function failOnce(app, base) {
+  const ch = await fetch(`${base}/challenge`);
+  if (ch.status !== 200) return { ch };
+  const c = await ch.json();
+  const ans = app.locals.challenges.get(c.id).answer;
+  await wait(70);
+  const bad = (ans + 100) % 360;
+  return { c, ans, r: await fetch(`${base}/verify`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: c.id, angle: bad, moves: moves(bad) }) }) };
+}
+const solve = async (app, base) => {
+  const c = await (await fetch(`${base}/challenge`)).json();
+  const ans = app.locals.challenges.get(c.id).answer;
+  await wait(70);
+  return (await post(base, { id: c.id, angle: ans, moves: moves(ans) })).json;
+};
+
+test('3 consecutive fails -> locked on /challenge and /verify with 429 + retry-after; each fail discards challenge', async () => {
+  const { app, base, close } = await boot({ lockoutMs: 60000 });
+  const seen = [];
+  const f1 = await failOnce(app, base); assert.strictEqual(f1.r.status, 200);
+  assert.ok(!app.locals.challenges.has(f1.c.id)); // discarded on fail
+  const f2 = await failOnce(app, base); assert.strictEqual(f2.r.status, 200);
+  assert.notStrictEqual(f1.c.id, f2.c.id); assert.notStrictEqual(f1.ans, f2.ans); // fresh id + fresh random angle
+  seen.push(f1.c.outer, f2.c.outer); assert.notStrictEqual(seen[0], seen[1]);
+  const f3 = await failOnce(app, base);
+  assert.strictEqual(f3.r.status, 429);
+  const body = await f3.r.json();
+  assert.strictEqual(body.error, 'locked'); assert.ok(body.retryAfterSec > 55 && body.retryAfterSec <= 60);
+  assert.ok(Number(f3.r.headers.get('retry-after')) > 55);
+  // locked out of both endpoints; no new puzzle issued
+  const before = app.locals.challenges.size;
+  const c = await fetch(`${base}/challenge`);
+  assert.strictEqual(c.status, 429); assert.strictEqual((await c.json()).error, 'locked');
+  assert.strictEqual(app.locals.challenges.size, before);
+  const v = await post(base, { id: 'x', angle: 1, moves: [] });
+  assert.strictEqual(v.status, 429);
+  close();
+});
+
+test('success resets the fail counter', async () => {
+  const { app, base, close } = await boot({ lockoutMs: 60000 });
+  await failOnce(app, base); await failOnce(app, base); // 2 fails
+  assert.strictEqual((await solve(app, base)).ok, true); // reset
+  assert.strictEqual(app.locals.fails.size, 0);
+  const a = await failOnce(app, base); const b = await failOnce(app, base);
+  assert.strictEqual(a.r.status, 200); assert.strictEqual(b.r.status, 200); // 2 more fails still not locked
+  assert.strictEqual((await fetch(`${base}/challenge`)).status, 200);
+  close();
+});
+
+test('lockout expires', async () => {
+  const { app, base, close } = await boot({ lockoutMs: 400 });
+  await failOnce(app, base); await failOnce(app, base);
+  assert.strictEqual((await failOnce(app, base)).r.status, 429);
+  assert.strictEqual((await fetch(`${base}/challenge`)).status, 429);
+  await wait(450);
+  assert.strictEqual((await fetch(`${base}/challenge`)).status, 200);
+  // counter restarted: one more fail is not a lock
+  assert.strictEqual((await failOnce(app, base)).r.status, 200);
+  close();
+});
