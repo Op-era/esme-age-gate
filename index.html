@@ -75,17 +75,188 @@
     font-size: 0.75rem;
     color: #5c5c63;
   }
+
+  .hidden { display: none !important; }
+  .captcha h1 { margin-bottom: 8px; }
+  .captcha p { margin-bottom: 18px; }
+  .puzzle {
+    position: relative;
+    width: 100%;
+    max-width: 320px;
+    aspect-ratio: 1 / 1;
+    margin: 0 auto 18px;
+    border-radius: 12px;
+    overflow: hidden;
+    background: #101013;
+    border: 1px solid #29292e;
+    touch-action: none;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  .puzzle img { position: absolute; display: block; pointer-events: none; -webkit-user-drag: none; }
+  .puzzle .outer { inset: 0; width: 100%; height: 100%; }
+  .puzzle .inner {
+    left: 50%; top: 50%;
+    transform: translate(-50%, -50%) rotate(0deg);
+    will-change: transform;
+    cursor: grab;
+    pointer-events: auto;
+  }
+  .puzzle .inner.drag { cursor: grabbing; }
+  .puzzle .skeleton {
+    position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    color: #5c5c63; font-size: 0.85rem;
+  }
+  .slider-wrap { margin: 0 auto 18px; max-width: 320px; }
+  input[type=range] {
+    -webkit-appearance: none; appearance: none; width: 100%; height: 44px; background: transparent; margin: 0;
+    touch-action: pan-y;
+  }
+  input[type=range]::-webkit-slider-runnable-track { height: 8px; border-radius: 4px; background: #2a2a30; }
+  input[type=range]::-moz-range-track { height: 8px; border-radius: 4px; background: #2a2a30; }
+  input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none; width: 34px; height: 34px; margin-top: -13px; border-radius: 50%;
+    background: #f5f5f5; border: 3px solid #0b0b0d; box-shadow: 0 0 0 1px #3a3a40;
+  }
+  input[type=range]::-moz-range-thumb { width: 28px; height: 28px; border-radius: 50%; background: #f5f5f5; border: 3px solid #0b0b0d; }
+  input[type=range]:focus-visible { outline: 2px solid #8a8af0; outline-offset: 2px; border-radius: 8px; }
+  button.btn {
+    width: 100%; max-width: 320px; padding: 14px 20px; border-radius: 10px; border: 0; cursor: pointer;
+    font: inherit; font-weight: 600; font-size: 1rem; background: #f5f5f5; color: #0b0b0d;
+  }
+  button.btn:disabled { opacity: 0.45; cursor: not-allowed; }
+  button.link {
+    background: none; border: 0; color: #a3a3ab; font: inherit; font-size: 0.85rem; text-decoration: underline;
+    cursor: pointer; margin-top: 14px; padding: 6px;
+  }
+  .status { min-height: 1.3em; margin: 12px 0 0; font-size: 0.85rem; color: #a3a3ab; }
+  .status.err { color: #ff8a8a; }
+  noscript p { color: #ff8a8a; }
 </style>
 </head>
 <body>
-  <div class="card">
-    <h1>Are you 18 years of age or older?</h1>
-    <p>This link leads to age-restricted content. Please confirm your age to continue.</p>
-    <div class="buttons">
-      <a class="btn yes" href="https://onlyfans.com/esmeaura">Yes, I am 18+</a>
-      <a class="btn no" href="https://emoji-isle.havencommand.com">No, take me back</a>
+  <!-- Step 1: human check. Nothing about the age gate (copy, links) is in the DOM until this succeeds. -->
+  <main class="card captcha" id="captcha" aria-live="polite">
+    <h1>Quick check: are you human?</h1>
+    <p>Drag the slider to rotate the inner circle until the picture lines up.</p>
+    <div class="puzzle" id="puzzle">
+      <div class="skeleton" id="skeleton">Loading puzzle&hellip;</div>
     </div>
-    <footer>By clicking "Yes," you confirm you are of legal age to view adult content in your jurisdiction.</footer>
-  </div>
+    <div class="slider-wrap">
+      <input type="range" id="rot" min="0" max="360" step="0.5" value="0" disabled aria-label="Rotate the inner circle" />
+    </div>
+    <button class="btn" id="submit" type="button" disabled>Verify</button>
+    <div class="status" id="status" role="status"></div>
+    <button class="link" id="refresh" type="button">Try a different picture</button>
+    <noscript><p>JavaScript is required for this check.</p></noscript>
+  </main>
+
+  <!-- Inert template: the age-gate card is only cloned into the page after server-side verification. -->
+  <template id="gate-tpl">
+    <div class="card" id="gate">
+      <h1>Are you 18 years of age or older?</h1>
+      <p>This link leads to age-restricted content. Please confirm your age to continue.</p>
+      <div class="buttons">
+        <a class="btn yes" data-role="yes">Yes, I am 18+</a>
+        <a class="btn no" href="https://emoji-isle.havencommand.com">No, take me back</a>
+      </div>
+      <footer>By clicking "Yes," you confirm you are of legal age to view adult content in your jurisdiction.</footer>
+    </div>
+  </template>
+
+<script>
+(function () {
+  'use strict';
+  // Verifier base URL (Fly.io). Override for local testing with ?api=http://localhost:8080
+  var DEFAULT_API = 'https://esme-age-captcha.fly.dev';
+  var qp = new URLSearchParams(location.search).get('api');
+  var API = (qp && /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(qp)) ? qp : DEFAULT_API;
+
+  var $ = function (id) { return document.getElementById(id); };
+  var puzzle = $('puzzle'), rot = $('rot'), btn = $('submit'), statusEl = $('status'), skeleton = $('skeleton');
+  var cur = null, innerImg = null, angle = 0, moves = [], t0 = 0, busy = false;
+
+  function setStatus(msg, err) { statusEl.textContent = msg || ''; statusEl.className = 'status' + (err ? ' err' : ''); }
+
+  function setAngle(a, record) {
+    angle = ((a % 360) + 360) % 360;
+    rot.value = angle;
+    if (innerImg) innerImg.style.transform = 'translate(-50%, -50%) rotate(' + angle + 'deg)';
+    if (record && cur) {
+      moves.push([Math.round(performance.now() - t0), Math.round(angle * 10) / 10]);
+      if (moves.length > 600) moves.splice(1, 1);
+    }
+  }
+
+  function load() {
+    if (busy) return;
+    busy = true; cur = null; moves = [];
+    btn.disabled = true; rot.disabled = true; setStatus('');
+    puzzle.innerHTML = ''; puzzle.appendChild(skeleton); skeleton.textContent = 'Loading puzzle\u2026';
+    fetch(API + '/challenge', { cache: 'no-store' })
+      .then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); })
+      .then(function (c) {
+        cur = c;
+        var o = new Image(); o.className = 'outer'; o.alt = 'Picture with a circular gap'; o.src = c.outer; o.draggable = false;
+        var i = new Image(); i.className = 'inner'; i.alt = 'Rotatable circle'; i.src = c.inner; i.draggable = false;
+        i.style.width = (c.innerSize / c.size * 100) + '%';
+        puzzle.innerHTML = ''; puzzle.appendChild(o); puzzle.appendChild(i);
+        innerImg = i; setAngle(0, false); t0 = performance.now();
+        moves.push([0, 0]);
+        rot.disabled = false; btn.disabled = false;
+        bindDrag(i);
+      })
+      .catch(function () { skeleton.textContent = 'Could not load the check.'; setStatus('Verification service unavailable. Please try again.', true); })
+      .then(function () { busy = false; });
+  }
+
+  function bindDrag(el) {
+    var dragging = false, startPtr = 0, startAng = 0;
+    function ptrAngle(e) {
+      var r = puzzle.getBoundingClientRect();
+      return Math.atan2(e.clientY - (r.top + r.height / 2), e.clientX - (r.left + r.width / 2)) * 180 / Math.PI;
+    }
+    el.addEventListener('pointerdown', function (e) { dragging = true; startPtr = ptrAngle(e); startAng = angle; el.classList.add('drag'); el.setPointerCapture(e.pointerId); e.preventDefault(); });
+    el.addEventListener('pointermove', function (e) { if (dragging) setAngle(startAng + (ptrAngle(e) - startPtr), true); });
+    function end() { dragging = false; el.classList.remove('drag'); }
+    el.addEventListener('pointerup', end); el.addEventListener('pointercancel', end);
+  }
+
+  rot.addEventListener('input', function () { setAngle(parseFloat(rot.value), true); });
+
+  btn.addEventListener('click', function () {
+    if (!cur || busy) return;
+    busy = true; btn.disabled = true; rot.disabled = true; setStatus('Checking\u2026');
+    var body = { id: cur.id, angle: Math.round(angle * 10) / 10, moves: moves };
+    fetch(API + '/verify', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+      .then(function (r) { return r.json().then(function (j) { return { status: r.status, j: j }; }); })
+      .then(function (res) {
+        if (res.j && res.j.ok && res.j.token) return unlock(res.j.token);
+        busy = false;
+        setStatus(res.status === 429 ? 'Too many attempts. Please wait a minute.' : 'That did not line up. Here is a new picture.', true);
+        if (res.status === 429) return;
+        setTimeout(load, 700);
+      })
+      .catch(function () { busy = false; setStatus('Verification service unavailable. Please try again.', true); btn.disabled = false; rot.disabled = false; });
+  });
+  $('refresh').addEventListener('click', load);
+
+  // Exchange the signed token for the destination link, then reveal the age gate.
+  function unlock(token) {
+    return fetch(API + '/gate', { headers: { Authorization: 'Bearer ' + token } })
+      .then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); })
+      .then(function (g) {
+        var node = $('gate-tpl').content.cloneNode(true);
+        node.querySelector('[data-role=yes]').setAttribute('href', g.yesUrl);
+        var cap = $('captcha');
+        cap.parentNode.replaceChild(node, cap);
+        busy = false;
+      })
+      .catch(function () { busy = false; setStatus('Could not complete verification. Please try again.', true); setTimeout(load, 900); });
+  }
+
+  load();
+})();
+</script>
 </body>
 </html>
